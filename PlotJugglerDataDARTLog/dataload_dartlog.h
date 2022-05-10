@@ -6,35 +6,35 @@
 
 using namespace PJ;
 
-class DataLoadDARTLog : public DataLoader
-{
-  Q_OBJECT
-  Q_PLUGIN_METADATA(IID "facontidavide.PlotJuggler3.DataLoader")
-  Q_INTERFACES(PJ::DataLoader)
+class DataLoadDARTLog : public DataLoader {
+    Q_OBJECT
+    Q_PLUGIN_METADATA(IID "facontidavide.PlotJuggler3.DataLoader")
+    Q_INTERFACES(PJ::DataLoader)
 
 public:
-  DataLoadDARTLog();
-  virtual const std::vector<const char*>& compatibleFileExtensions() const override;
+    DataLoadDARTLog();
 
-  bool readDataFromFile(PJ::FileLoadInfo* fileload_info,
-                        PlotDataMapRef& destination) override;
+    virtual const std::vector<const char *> &compatibleFileExtensions() const override;
 
-  ~DataLoadDARTLog() override = default;
+    bool readDataFromFile(PJ::FileLoadInfo *fileload_info,
+                          PlotDataMapRef &destination) override;
 
-  virtual const char* name() const override
-  {
-    return "DARTLog Reader";
-  }
+    ~DataLoadDARTLog() override = default;
+
+    virtual const char *name() const override {
+        return "DARTLog Reader";
+    }
 
 
 protected:
-  uint16_t readUint16(QFile* file);
-  std::string readString(QFile* file);
+    uint16_t readUint16(QFile *file);
+
+    std::string readString(QFile *file);
 
 private:
-  std::vector<const char*> _extensions;
+    std::vector<const char *> _extensions;
 
-  std::string _default_time_axis;
+    std::string _default_time_axis;
 };
 
 
