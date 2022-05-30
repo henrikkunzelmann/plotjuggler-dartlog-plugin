@@ -20,6 +20,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
 
     std::map<uint16_t, uint16_t> tags;
     std::map<uint16_t, PlotData *> plots;
+    std::vector<std::string> tagNames;
     uint16_t maxTagID = 0;
     uint16_t timeTagID = 0;
     float time = 0;
@@ -59,6 +60,16 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
 
             if (name == "time")
                 timeTagID = tagIndex;
+
+            // Check if the name is the start of a different value
+            for (size_t i = 0; i < tagNames.size(); i++) {
+                if (tagNames[i]._Starts_with(name)) {
+                    name += "/Value";
+                    break;
+                }
+            }
+
+            tagNames.push_back(name);
 
             auto it = plot_data.addNumeric(name);
             plots[tagIndex] = &it->second;
