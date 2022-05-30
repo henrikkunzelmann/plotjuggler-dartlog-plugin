@@ -2,10 +2,11 @@ cmake_minimum_required(VERSION 3.7)
 
 project(plotjuggler_sample_plugins)
 
-set(PlotJuggler_ROOT_DIR "/home/henrik/PlotJuggler/build/")
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Windows Qt5
+set (CMAKE_PREFIX_PATH "C:\\Qt\\5.15.2\\msvc2019_64\\")
 
 set(CMAKE_MODULE_PATH
     ${CMAKE_MODULE_PATH}
