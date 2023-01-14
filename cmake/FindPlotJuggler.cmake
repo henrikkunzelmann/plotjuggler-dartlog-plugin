@@ -16,12 +16,6 @@
 #  FindPackageHandleStandardArgs (known included with CMake >=2.6.2)
 #
 
-set(PlotJuggler_ROOT_DIR
-    "E:\\DART Racing\\PlotJuggler.build\\"
-    CACHE
-    PATH
-    "Directory to search")
-
 if(CMAKE_SIZEOF_VOID_P MATCHES "8")
     set(_LIBSUFFIXES /lib64 /lib)
 else()
@@ -35,12 +29,6 @@ find_library(PlotJuggler_LIBRARY
     "${PlotJuggler_ROOT_DIR}"
     PATH_SUFFIXES
     "${_LIBSUFFIXES}")
-
-
-
-set(PlotJuggler_INCLUDE_DIR "E:\\DART Racing\\PlotJuggler\\plotjuggler_base\\include\\PlotJuggler")
-set(PlotJuggler_LIBRARY "E:\\DART Racing\\PlotJuggler.build\\RelWithDebInfo\\plotjuggler_base.lib")
-
 
 # Might want to look close to the library first for the includes.
 get_filename_component(_libdir "${PlotJuggler_LIBRARY}" PATH)

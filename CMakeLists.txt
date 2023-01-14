@@ -1,12 +1,19 @@
 cmake_minimum_required(VERSION 3.7)
 
-project(plotjuggler_sample_plugins)
+project(plotjuggler_dartracing_plugins)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Windows Qt5
 set (CMAKE_PREFIX_PATH "C:\\Qt\\5.15.2\\msvc2019_64\\")
+
+# PlotJuggler build
+set(PlotJuggler_ROOT_DIR "E:\\DART Racing\\PlotJuggler\\PlotJuggler.build\\")
+set(PlotJuggler_INCLUDE_DIR "E:\\DART Racing\\PlotJuggler\\PlotJuggler\\plotjuggler_base\\include\\PlotJuggler")
+set(PlotJuggler_LIBRARY "E:\\DART Racing\\PlotJuggler\\PlotJuggler.build\\RelWithDebInfo\\plotjuggler_base.lib")
+
+message(STATUS "Searching for PlotJuggler in: ${PlotJuggler_ROOT_DIR}")
 
 set(CMAKE_MODULE_PATH
     ${CMAKE_MODULE_PATH}
