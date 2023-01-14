@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.7)
 
-project(plotjuggler_dartracing_plugins)
+project(plotjuggler_dartlog_plugin)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -94,8 +94,8 @@ add_library(PlotJugglerDataDARTLog SHARED
    PlotJugglerDataDARTLog/dataload_dartlog.h
    PlotJugglerDataDARTLog/dataload_dartlog.cpp )
 
-target_link_libraries(PlotJugglerDataDARTLog
-    ${PJ_LIBRARIES} ${PlotJuggler_LIBRARIES})
+target_link_libraries(PlotJugglerDataDARTLog ${PJ_LIBRARIES} plotjuggler_base)
+# target_link_libraries(PlotJugglerDataDARTLog ${PJ_LIBRARIES})
 
 if (COMPILING_WITH_AMENT)
     ament_target_dependencies(PlotJugglerDataDARTLog plotjuggler)
