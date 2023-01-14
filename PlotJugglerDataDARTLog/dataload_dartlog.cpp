@@ -154,6 +154,11 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
         }
     }
 
+    // Add logger informations
+    PlotData::Point version(0, 2);
+    plot_data.addNumeric("dartlog_plugin_version")->second.pushBack(version);
+
+
     //QMessageBox::information(nullptr, "File successfully read",  QString("Found %1 signals").arg(maxTagID));
 
     file.close();
