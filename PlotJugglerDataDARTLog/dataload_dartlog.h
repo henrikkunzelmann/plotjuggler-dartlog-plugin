@@ -27,6 +27,7 @@ public:
 
 
 protected:
+    uint8_t readUint8(QFile* file);
     uint16_t readUint16(QFile *file);
 
     std::string readString(QFile *file);
