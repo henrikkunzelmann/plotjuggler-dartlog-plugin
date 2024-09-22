@@ -81,7 +81,7 @@ else()
     find_package(PlotJuggler REQUIRED)
     message(STATUS "PlotJuggler FOUND")
 
-    include_directories(${PlotJuggler_INCLUDE_DIRS})
+    include_directories(${PlotJuggler_INCLUDE_DIRS} "zlib/include/")
     list(APPEND ${PJ_LIBRARIES} ${PlotJuggler_LIBRARIES} )
     set(PJ_PLUGIN_INSTALL_DIRECTORY bin )
 
@@ -92,9 +92,11 @@ endif()
 
 add_library(PlotJugglerDataDARTLog SHARED
    PlotJugglerDataDARTLog/dataload_dartlog.h
-   PlotJugglerDataDARTLog/dataload_dartlog.cpp )
+   PlotJugglerDataDARTLog/dataload_dartlog.cpp
+   PlotJugglerDataDARTLog/qcompressor.h
+   PlotJugglerDataDARTLog/qcompressor.cpp   )
 
-target_link_libraries(PlotJugglerDataDARTLog ${PJ_LIBRARIES} plotjuggler_base)
+target_link_libraries(PlotJugglerDataDARTLog ${PJ_LIBRARIES} ${PlotJuggler_LIBRARY} "${CMAKE_CURRENT_SOURCE_DIR}/zlib/lib/zlibwapi.lib")
 # target_link_libraries(PlotJugglerDataDARTLog ${PJ_LIBRARIES})
 
 if (COMPILING_WITH_AMENT)

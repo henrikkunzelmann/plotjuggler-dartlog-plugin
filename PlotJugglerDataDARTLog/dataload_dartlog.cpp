@@ -7,12 +7,16 @@
 #include <map>
 #include <QFileInfo>
 
+#include "qcompressor.h"
+
+// Supported by plotjuggler nativly now
 #define DISABLE_PREFIX_QUESTION 1
 #define REDUCE_PLOT 0
 #define ADD_EDGES_TO_PLOT 0
 
 DataLoadDARTLog::DataLoadDARTLog() {
     _extensions.push_back("dat");
+    _extensions.push_back("gz");
 }
 
 const std::vector<const char *> &DataLoadDARTLog::compatibleFileExtensions() const {
@@ -23,6 +27,49 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
     QFile file(info->filename);
     if (!file.open(QFile::ReadOnly))
         return false;
+
+    // Load file info
+    QFileInfo fileInfo(info->filename);
+
+    // Show progress dialog
+    QProgressDialog progress_dialog;
+    progress_dialog.setWindowTitle("DARTLOG Plugin");
+    progress_dialog.setLabelText("Loading... please wait");
+    progress_dialog.setWindowModality(Qt::ApplicationModal);
+    progress_dialog.setAutoClose(true);
+    progress_dialog.setAutoReset(true);
+    progress_dialog.show();
+    progress_dialog.setValue(0);
+
+    QApplication::processEvents();
+
+    bool isGZip = info->filename.endsWith(".gz", Qt::CaseInsensitive);
+    if (isGZip) {
+        // Do not directly read file
+        inputFile = nullptr;
+        pos = 0;
+
+        progress_dialog.setLabelText("Decompression... please wait");
+        QByteArray data = file.readAll();
+        if (data.size() == 0) {
+            QMessageBox::warning(nullptr, "Error reading file", "Could not read file");
+            return false;
+        }
+        file.close();
+
+        if (!QCompressor::gzipDecompress(data, inputData, &progress_dialog)) {
+            QMessageBox::warning(nullptr, "Warning reading file", "Could not fully decompress file: data may be incomplete or fully missing");
+        }
+    }
+    else {
+        // Directly read file
+        inputFile = &file;
+    }
+
+    progress_dialog.setLabelText("Loading data... please wait");
+    progress_dialog.setValue(0);
+    progress_dialog.setRange(0, getSize());
+    QApplication::processEvents();
 
     std::map<uint16_t, uint16_t> tags;
     std::map<uint16_t, PlotData *> plots;
@@ -36,7 +83,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
     float time = 0;
 
     // Read header
-    std::string header = readString(&file);
+    std::string header = readString();
     if (header != "DARTLOG" && header != "DARTLOG2") {
         QMessageBox::warning(nullptr, "Error reading file", "Not a DARTLOG file: header missing.");
         return false;
@@ -53,27 +100,13 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
 #else
     bool usePrefix = QMessageBox::question(nullptr, "Load with prefix?", "Do you want to load the data with a prefix? If yes, you can load multiple data sets in the same PlotJuggler instance.", QMessageBox::Yes | QMessageBox::No) == QMessageBox::StandardButton::Yes;
 #endif
-    QFileInfo fileInfo(info->filename);
-
-    QProgressDialog progress_dialog;
-    progress_dialog.setWindowTitle("DARTLOG Plugin");
-    progress_dialog.setLabelText("Loading... please wait");
-    progress_dialog.setWindowModality(Qt::ApplicationModal);
-    progress_dialog.setRange(0, file.size());
-    progress_dialog.setAutoClose(true);
-    progress_dialog.setAutoReset(true);
-    progress_dialog.show();
-    progress_dialog.setValue(0);
-
-    QApplication::processEvents();
-
     uint64_t counter = 0;
     uint16_t lastID = 0;
 
-    while (!file.atEnd()) {
+    while (!atEnd()) {
         // Update file progress dialog
         if (counter % (1024 * 32) == 0) {
-            progress_dialog.setValue(file.pos());
+            progress_dialog.setValue(getPos());
             if (progress_dialog.wasCanceled())
                 break;
 
@@ -84,24 +117,24 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
         // Read next tag
         uint16_t id;
         if (isAtLeastDARTLOG2) {
-            uint8_t idPart = readUint8(&file);
+            uint8_t idPart = readUint8();
             if (idPart == 255)
-                id = readUint16(&file);
+                id = readUint16();
             else if (idPart == 254)
                 id = lastID + 1;
             else
                 id = idPart;
         }
         else
-            id = readUint16(&file);
+            id = readUint16();
 
         lastID = id;
 
         if (id == 0) {
-            uint16_t tagIndex = readUint16(&file);
+            uint16_t tagIndex = readUint16();
 
             uint8_t tagType;
-            file.read((char *) &tagType, sizeof(tagType));
+            read((char *) &tagType, sizeof(tagType));
 
             if (tagType < 1 || tagType > 10) {
                 QMessageBox::warning(nullptr, "Error reading file", "Wrong tag type read");
@@ -112,7 +145,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
             if (tagIndex > maxTagID)
                 maxTagID = tagIndex;
 
-            std::string name = readString(&file);
+            std::string name = readString();
 
             if (name.length() == 0) {
                 QMessageBox::warning(nullptr, "Error reading file", "Empty tag name read");
@@ -126,22 +159,22 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
                 while (true)
                 {
                     uint8_t attributeType;
-                    file.read((char*)&attributeType, sizeof(attributeType));
+                    read((char*)&attributeType, sizeof(attributeType));
 
                     if (attributeType == 0)
                         break;
 
                     uint8_t attributeLength;
-                    file.read((char*)&attributeLength, sizeof(attributeLength));
+                    read((char*)&attributeLength, sizeof(attributeLength));
 
                     switch (attributeType)
                     {
                         case 1: // unit
-                            unit = readString(&file);
+                            unit = readString();
                             std::replace(unit.begin(), unit.end(), '/', '_');
                             break;
                         default:
-                            file.skip(attributeLength);
+                            skip(attributeLength);
                             break;
                     }
                 }
@@ -192,61 +225,61 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
             switch (type) {
                 case 1: {
                     uint8_t v;
-                    file.read((char *) &v, sizeof(v));
+                    read((char *) &v, sizeof(v));
                     value = (double) v;
                     break;
                 }
                 case 2: {
                     uint16_t v;
-                    file.read((char *) &v, sizeof(v));
+                    read((char *) &v, sizeof(v));
                     value = (double) v;
                     break;
                 }
                 case 3: {
                     uint32_t v;
-                    file.read((char *) &v, sizeof(v));
+                    read((char *) &v, sizeof(v));
                     value = (double) v;
                     break;
                 }
                 case 4: {
                     int8_t v;
-                    file.read((char *) &v, sizeof(v));
+                    read((char *) &v, sizeof(v));
                     value = (double) v;
                     break;
                 }
                 case 5: {
                     int16_t v;
-                    file.read((char *) &v, sizeof(v));
+                    read((char *) &v, sizeof(v));
                     value = (double) v;
                     break;
                 }
                 case 6: {
                     int32_t v;
-                    file.read((char *) &v, sizeof(v));
+                    read((char *) &v, sizeof(v));
                     value = (double) v;
                     break;
                 }
                 case 7: {
                     float v;
-                    file.read((char *) &v, sizeof(v));
+                    read((char *) &v, sizeof(v));
                     value = (double) v;
                     break;
                 }
                 case 8: {
                     double v;
-                    file.read((char *) &v, sizeof(v));
+                    read((char *) &v, sizeof(v));
                     value = (double) v;
                     break;
                 }
                 case 9: {
                     uint64_t v;
-                    file.read((char *) &v, sizeof(v));
+                    read((char *) &v, sizeof(v));
                     value = (double) v;
                     break;
                 }
                 case 10: {
                     int64_t v;
-                    file.read((char *) &v, sizeof(v));
+                    read((char *) &v, sizeof(v));
                     value = (double) v;
                     break;
                 }
@@ -299,32 +332,77 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
     plot_data.addNumeric("dartlog_version_data")->second.pushBack(dartLogVersion);
     plot_data.addNumeric("dartlog_version_plugin")->second.pushBack(version);
 
+    PlotData::Point gzipPoint(0, isGZip ? 1 : 0);
+    plot_data.addNumeric("dartlog_is_gzip")->second.pushBack(gzipPoint);
+
 
     // QMessageBox::information(nullptr, "File successfully read",  QString("Found %1 signals").arg(maxTagID));
 
-    file.close();
+    close();
     progress_dialog.close();
     return true;
 }
 
-uint8_t DataLoadDARTLog::readUint8(QFile* file) {
+void DataLoadDARTLog::close() {
+    if (inputFile != nullptr)
+        inputFile->close();
+}
+
+qint64 DataLoadDARTLog::getPos() {
+    if (inputFile != nullptr)
+        return inputFile->pos();
+    return pos;
+}
+
+qint64 DataLoadDARTLog::getSize() {
+    if (inputFile != nullptr)
+        return inputFile->size();
+    return inputData.size();
+}
+
+bool DataLoadDARTLog::atEnd() {
+    if (inputFile != nullptr)
+        return inputFile->atEnd();
+    return pos >= inputData.size();
+}
+
+qint64 DataLoadDARTLog::read(char* data, qint64 maxLen) {
+    if (inputFile != nullptr)
+        return inputFile->read(data, maxLen);
+
+    for (size_t i = 0; i < maxLen; i++) {
+        if (atEnd())
+            break;
+        data[i] = inputData.at(pos++);
+    }
+    return maxLen;
+}
+
+void DataLoadDARTLog::skip(qint64 bytes) {
+    if (inputFile != nullptr)
+        inputFile->skip(bytes);
+    else
+        pos += bytes;
+}
+
+uint8_t DataLoadDARTLog::readUint8() {
     uint8_t b;
-    file->read((char*)&b, sizeof(b));
+    read((char*)&b, sizeof(b));
     return b;
 }
 
-uint16_t DataLoadDARTLog::readUint16(QFile *file) {
+uint16_t DataLoadDARTLog::readUint16() {
     uint8_t b[2];
-    file->read((char *) b, sizeof(b));
+    read((char *) b, sizeof(b));
 
     return b[0] + b[1] * 256;
 }
 
-std::string DataLoadDARTLog::readString(QFile *file) {
+std::string DataLoadDARTLog::readString() {
     std::string str = "";
-    while (!file->atEnd()) {
+    while (!atEnd()) {
         char c;
-        file->read(&c, sizeof(c));
+        read(&c, sizeof(c));
         if (c == 0)
             return str;
         str += c;

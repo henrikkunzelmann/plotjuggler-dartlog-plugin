@@ -27,10 +27,20 @@ public:
 
 
 protected:
-    uint8_t readUint8(QFile* file);
-    uint16_t readUint16(QFile *file);
+    QByteArray inputData;
+    QFile* inputFile;
+    qint64 pos;
 
-    std::string readString(QFile *file);
+    void close();
+    qint64 getPos();
+    qint64 getSize();
+    bool atEnd();
+    qint64 read(char* data, qint64 maxLen);
+    void skip(qint64 bytes);
+    uint8_t readUint8();
+    uint16_t readUint16();
+
+    std::string readString();
 
 private:
     std::vector<const char *> _extensions;
