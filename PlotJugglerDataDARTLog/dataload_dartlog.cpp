@@ -76,6 +76,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
     std::map<uint16_t, double> lastTime;
     std::map<uint16_t, double> lastValue;
     std::map<uint16_t, bool> isXY;
+    std::map<uint16_t, bool> isVerbose;
     std::vector<uint16_t> tagIndices;
     std::vector<std::string> tagNames;
     uint16_t maxTagID = 0;
@@ -100,6 +101,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
 #else
     bool usePrefix = QMessageBox::question(nullptr, "Load with prefix?", "Do you want to load the data with a prefix? If yes, you can load multiple data sets in the same PlotJuggler instance.", QMessageBox::Yes | QMessageBox::No) == QMessageBox::StandardButton::Yes;
 #endif
+    bool loadVerboseData = false;
     uint64_t counter = 0;
     uint16_t lastID = 0;
 
@@ -154,6 +156,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
 
 
             std::string unit = "";
+            bool verbose = false;
             if (isAtLeastDARTLOG2)
             {
                 while (true)
@@ -169,10 +172,16 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
 
                     switch (attributeType)
                     {
-                        case 1: // unit
+                        case 1: {   // unit
                             unit = readString();
                             std::replace(unit.begin(), unit.end(), '/', '_');
                             break;
+                        }
+                        case 2: { // verbose signal
+                            verbose = readUint8() > 0;
+                            break;
+                        }
+                          
                         default:
                             skip(attributeLength);
                             break;
@@ -203,8 +212,15 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
             tagIndices.push_back(tagIndex);
             tagNames.push_back(name);
 
-            auto it = plot_data.addNumeric(name);
-            plots[tagIndex] = &it->second;
+            if (verbose && !loadVerboseData) {
+                plots[tagIndex] = nullptr;
+            }
+            else {
+                auto it = plot_data.addNumeric(name);
+                plots[tagIndex] = &it->second;
+            }
+
+            isVerbose[tagIndex] = verbose;
 
             lastValue[tagIndex] = DBL_MAX;
             lastTime[tagIndex] = -1;
@@ -288,6 +304,11 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
             if (id == timeTagID)
                 time = value;
 
+            // Skip verbose values
+            PJ::PlotData* data = plots[id];
+            if (data == nullptr)
+                continue;
+
 #if REDUCE_PLOT
             double lastVal = lastValue[id];
             double lastT = lastTime[id];
@@ -312,7 +333,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
             }
 #else
             PlotData::Point point(time, value);
-            plots[id]->pushBack(point);
+            data->pushBack(point);
 #endif
         }
     }
@@ -328,13 +349,17 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
     }
 
     // Add logger informations
-    PlotData::Point version(0, 7);
+    PlotData::Point version(0, 12);
     plot_data.addNumeric("dartlog_version_data")->second.pushBack(dartLogVersion);
     plot_data.addNumeric("dartlog_version_plugin")->second.pushBack(version);
 
     PlotData::Point gzipPoint(0, isGZip ? 1 : 0);
     plot_data.addNumeric("dartlog_is_gzip")->second.pushBack(gzipPoint);
 
+    if (!loadVerboseData) {
+        PlotData::Point gzipPoint(0, isGZip ? 1 : 0);
+        plot_data.addNumeric("VERBOSE_DATA_NOT_LOADED")->second.pushBack(gzipPoint);
+    }
 
     // QMessageBox::information(nullptr, "File successfully read",  QString("Found %1 signals").arg(maxTagID));
 
