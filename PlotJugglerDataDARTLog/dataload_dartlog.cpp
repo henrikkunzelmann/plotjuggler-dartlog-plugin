@@ -105,6 +105,8 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
     uint64_t counter = 0;
     uint16_t lastID = 0;
 
+    uint32_t verboseSignalsIgnoredCount = 0;
+
     while (!atEnd()) {
         // Update file progress dialog
         if (counter % (1024 * 32) == 0) {
@@ -214,6 +216,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
 
             if (verbose && !loadVerboseData) {
                 plots[tagIndex] = nullptr;
+                verboseSignalsIgnoredCount++;
             }
             else {
                 auto it = plot_data.addNumeric(name);
@@ -357,8 +360,12 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
     plot_data.addNumeric("dartlog_is_gzip")->second.pushBack(gzipPoint);
 
     if (!loadVerboseData) {
-        PlotData::Point gzipPoint(0, isGZip ? 1 : 0);
-        plot_data.addNumeric("VERBOSE_DATA_NOT_LOADED")->second.pushBack(gzipPoint);
+        PlotData::Point verbosePoint(0, verboseSignalsIgnoredCount);
+        plot_data.addNumeric("VERBOSE_DATA_NOT_LOADED")->second.pushBack(verbosePoint);
+        PlotData::Point verboseCountPoint(0, verboseSignalsIgnoredCount);
+        plot_data.addNumeric("verbose_signal_count")->second.pushBack(verboseCountPoint);
+
+        
     }
 
     // QMessageBox::information(nullptr, "File successfully read",  QString("Found %1 signals").arg(maxTagID));
