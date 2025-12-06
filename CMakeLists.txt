@@ -9,9 +9,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set (CMAKE_PREFIX_PATH "C:\\Qt\\5.15.2\\msvc2019_64\\")
 
 # PlotJuggler build
-set(PlotJuggler_ROOT_DIR "E:\\DART Racing\\PlotJuggler\\PlotJuggler.build\\")
-set(PlotJuggler_INCLUDE_DIR "E:\\DART Racing\\PlotJuggler\\PlotJuggler\\plotjuggler_base\\include\\PlotJuggler")
-set(PlotJuggler_LIBRARY "E:\\DART Racing\\PlotJuggler\\PlotJuggler.build\\RelWithDebInfo\\plotjuggler_base.lib")
+set(PlotJuggler_ROOT_DIR "F:\\DART Racing\\PlotJuggler\\PlotJuggler.build\\")
+set(PlotJuggler_INCLUDE_DIR "F:\\DART Racing\\PlotJuggler\\PlotJuggler\\plotjuggler_base\\include\\PlotJuggler")
+set(PlotJuggler_LIBRARY "F:\\DART Racing\\PlotJuggler\\PlotJuggler.build\\RelWithDebInfo\\plotjuggler_base.lib")
 
 message(STATUS "Searching for PlotJuggler in: ${PlotJuggler_ROOT_DIR}")
 
