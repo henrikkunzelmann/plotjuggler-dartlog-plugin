@@ -29,13 +29,16 @@ public:
 protected:
     QByteArray inputData;
     QFile* inputFile;
+    size_t inputFileSize;
+
     qint64 pos;
 
     void close();
     qint64 getPos();
     qint64 getSize();
     bool atEnd();
-    qint64 read(char* data, qint64 maxLen);
+    bool atEnd(size_t len);
+    void read(char* data, qint64 maxLen);
     void skip(qint64 bytes);
     uint8_t readUint8();
     uint16_t readUint16();

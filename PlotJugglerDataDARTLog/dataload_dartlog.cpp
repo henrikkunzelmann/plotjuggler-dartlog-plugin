@@ -4,26 +4,48 @@
 #include <QDateTime>
 #include <QInputDialog>
 #include <qprogressdialog.h>
-#include <map>
+#include <vector>
 #include <QFileInfo>
 
 #include "qcompressor.h"
+#include <chrono>
 
-// Supported by plotjuggler nativly now
 #define DISABLE_PREFIX_QUESTION 1
 #define REDUCE_PLOT 0
-#define ADD_EDGES_TO_PLOT 0
+#define ADD_EDGES_TO_PLOT 
+
+class PlotDataAccessor : public PlotData {
+public:
+    std::deque<Point>* directAccessPoints() {
+        return &_points;
+    }
+};
+
+// Struct to hold all tag-related data
+struct TagData {
+    uint16_t type;
+    PlotDataAccessor* plot;
+    std::deque<PlotData::Point>* plotData;
+    double lastTime;
+    double lastValue;
+    bool isXY;
+    bool isVerbose;
+    std::string tagName;
+};
 
 DataLoadDARTLog::DataLoadDARTLog() {
     _extensions.push_back("dat");
     _extensions.push_back("gz");
 }
 
-const std::vector<const char *> &DataLoadDARTLog::compatibleFileExtensions() const {
+const std::vector<const char*>& DataLoadDARTLog::compatibleFileExtensions() const {
     return _extensions;
 }
 
-bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_data) {
+TagData tagData[UINT16_MAX];
+
+
+bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_data) {
     QFile file(info->filename);
     if (!file.open(QFile::ReadOnly))
         return false;
@@ -43,6 +65,9 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
 
     QApplication::processEvents();
 
+    double decompress_duration_ms = 0;
+    double reading_duration_ms = 0;
+
     bool isGZip = info->filename.endsWith(".gz", Qt::CaseInsensitive);
     if (isGZip) {
         // Do not directly read file
@@ -57,28 +82,26 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
         }
         file.close();
 
+        auto decompress_start = std::chrono::high_resolution_clock::now();
         if (!QCompressor::gzipDecompress(data, inputData, &progress_dialog)) {
             QMessageBox::warning(nullptr, "Warning reading file", "Could not fully decompress file: data may be incomplete or fully missing");
         }
+        auto decompress_end = std::chrono::high_resolution_clock::now();
+        decompress_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(decompress_end - decompress_start).count();
     }
     else {
         // Directly read file
         inputFile = &file;
+		inputFileSize = file.size();
     }
 
     progress_dialog.setLabelText("Loading data... please wait");
     progress_dialog.setValue(0);
-    progress_dialog.setRange(0, getSize());
+    progress_dialog.setRange(0, 100);
     QApplication::processEvents();
 
-    std::map<uint16_t, uint16_t> tags;
-    std::map<uint16_t, PlotData *> plots;
-    std::map<uint16_t, double> lastTime;
-    std::map<uint16_t, double> lastValue;
-    std::map<uint16_t, bool> isXY;
-    std::map<uint16_t, bool> isVerbose;
-    std::vector<uint16_t> tagIndices;
-    std::vector<std::string> tagNames;
+    auto reading_start = std::chrono::high_resolution_clock::now();
+
     uint16_t maxTagID = 0;
     uint16_t timeTagID = 0;
     float time = 0;
@@ -104,19 +127,25 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
     bool loadVerboseData = false;
     uint64_t counter = 0;
     uint16_t lastID = 0;
+    const uint64_t progressDialogTickMask = (1024 * 1024);
 
     uint32_t verboseSignalsIgnoredCount = 0;
 
-    while (!atEnd()) {
+    PlotData::Point point(0, 0);
+    while (true) {
         // Update file progress dialog
-        if (counter % (1024 * 32) == 0) {
-            progress_dialog.setValue(getPos());
+        if ((counter & (progressDialogTickMask - 1)) == 0) {
+            progress_dialog.setValue((int)std::round((double)getPos() / inputFileSize * 100));
             if (progress_dialog.wasCanceled())
                 break;
 
             QApplication::processEvents();
         }
         counter++;
+
+        // Check if at end
+		if (atEnd(64)) // some margin
+            break;
 
         // Read next tag
         uint16_t id;
@@ -138,14 +167,15 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
             uint16_t tagIndex = readUint16();
 
             uint8_t tagType;
-            read((char *) &tagType, sizeof(tagType));
+            read((char*)&tagType, sizeof(tagType));
 
             if (tagType < 1 || tagType > 10) {
                 QMessageBox::warning(nullptr, "Error reading file", "Wrong tag type read");
                 break;
             }
 
-            tags[tagIndex] = tagType;
+            tagData[tagIndex].type = tagType;
+
             if (tagIndex > maxTagID)
                 maxTagID = tagIndex;
 
@@ -155,7 +185,6 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
                 QMessageBox::warning(nullptr, "Error reading file", "Empty tag name read");
                 break;
             }
-
 
             std::string unit = "";
             bool verbose = false;
@@ -174,19 +203,19 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
 
                     switch (attributeType)
                     {
-                        case 1: {   // unit
-                            unit = readString();
-                            std::replace(unit.begin(), unit.end(), '/', '_');
-                            break;
-                        }
-                        case 2: { // verbose signal
-                            verbose = readUint8() > 0;
-                            break;
-                        }
-                          
-                        default:
-                            skip(attributeLength);
-                            break;
+                    case 1: {   // unit
+                        unit = readString();
+                        std::replace(unit.begin(), unit.end(), '/', '_');
+                        break;
+                    }
+                    case 2: { // verbose signal
+                        verbose = readUint8() > 0;
+                        break;
+                    }
+
+                    default:
+                        skip(attributeLength);
+                        break;
                     }
                 }
             }
@@ -196,12 +225,12 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
             if (name == "time")
                 timeTagID = tagIndex;
 
-            if (usePrefix) 
+            if (usePrefix)
                 name = fileInfo.baseName().toStdString() + "/" + name;
 
             // Check if the name is the start of a different value
-            for (size_t i = 0; i < tagNames.size(); i++) {
-                if (tagNames[i]._Starts_with(name)) {
+            for (size_t i = 0; i < maxTagID; i++) {
+                if (!tagData[i].tagName.empty() && tagData[i].tagName._Starts_with(name)) {
                     name += "/Value";
                     break;
                 }
@@ -211,143 +240,150 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
             if (unit.length() > 0)
                 name += "_" + unit;
 
-            tagIndices.push_back(tagIndex);
-            tagNames.push_back(name);
+            tagData[tagIndex].tagName = name;
 
             if (verbose && !loadVerboseData) {
-                plots[tagIndex] = nullptr;
+                tagData[tagIndex].plot = nullptr;
                 verboseSignalsIgnoredCount++;
             }
             else {
                 auto it = plot_data.addNumeric(name);
-                plots[tagIndex] = &it->second;
+                auto plot = (PlotDataAccessor*)&it->second;
+
+                tagData[tagIndex].plot = plot;
+				tagData[tagIndex].plotData = plot->directAccessPoints();
             }
 
-            isVerbose[tagIndex] = verbose;
-
-            lastValue[tagIndex] = DBL_MAX;
-            lastTime[tagIndex] = -1;
-        } else {
+            tagData[tagIndex].isVerbose = verbose;
+        }
+        else {
             if (id > maxTagID) {
                 QMessageBox::warning(nullptr, "Error reading file", "Invalid ID read: over max tag id");
                 break;
             }
-            if (tags.find(id) == tags.end()) {
+
+			const auto& tag = tagData[id];
+            if (tag.type == 0) {
                 QMessageBox::warning(nullptr, "Error reading file", "Invalid ID read: unknown tag id");
                 break;
             }
 
             // Read value
-            uint8_t type = tags[id];
+            uint8_t type = tag.type;
 
             double value = 0;
             switch (type) {
-                case 1: {
-                    uint8_t v;
-                    read((char *) &v, sizeof(v));
-                    value = (double) v;
-                    break;
-                }
-                case 2: {
-                    uint16_t v;
-                    read((char *) &v, sizeof(v));
-                    value = (double) v;
-                    break;
-                }
-                case 3: {
-                    uint32_t v;
-                    read((char *) &v, sizeof(v));
-                    value = (double) v;
-                    break;
-                }
-                case 4: {
-                    int8_t v;
-                    read((char *) &v, sizeof(v));
-                    value = (double) v;
-                    break;
-                }
-                case 5: {
-                    int16_t v;
-                    read((char *) &v, sizeof(v));
-                    value = (double) v;
-                    break;
-                }
-                case 6: {
-                    int32_t v;
-                    read((char *) &v, sizeof(v));
-                    value = (double) v;
-                    break;
-                }
-                case 7: {
-                    float v;
-                    read((char *) &v, sizeof(v));
-                    value = (double) v;
-                    break;
-                }
-                case 8: {
-                    double v;
-                    read((char *) &v, sizeof(v));
-                    value = (double) v;
-                    break;
-                }
-                case 9: {
-                    uint64_t v;
-                    read((char *) &v, sizeof(v));
-                    value = (double) v;
-                    break;
-                }
-                case 10: {
-                    int64_t v;
-                    read((char *) &v, sizeof(v));
-                    value = (double) v;
-                    break;
-                }
+            case 1: {
+                uint8_t v;
+                read((char*)&v, sizeof(v));
+                value = (double)v;
+                break;
+            }
+            case 2: {
+                uint16_t v;
+                read((char*)&v, sizeof(v));
+                value = (double)v;
+                break;
+            }
+            case 3: {
+                uint32_t v;
+                read((char*)&v, sizeof(v));
+                value = (double)v;
+                break;
+            }
+            case 4: {
+                int8_t v;
+                read((char*)&v, sizeof(v));
+                value = (double)v;
+                break;
+            }
+            case 5: {
+                int16_t v;
+                read((char*)&v, sizeof(v));
+                value = (double)v;
+                break;
+            }
+            case 6: {
+                int32_t v;
+                read((char*)&v, sizeof(v));
+                value = (double)v;
+                break;
+            }
+            case 7: {
+                float v;
+                read((char*)&v, sizeof(v));
+                value = (double)v;
+                break;
+            }
+            case 8: {
+                double v;
+                read((char*)&v, sizeof(v));
+                value = (double)v;
+                break;
+            }
+            case 9: {
+                uint64_t v;
+                read((char*)&v, sizeof(v));
+                value = (double)v;
+                break;
+            }
+            case 10: {
+                int64_t v;
+                read((char*)&v, sizeof(v));
+                value = (double)v;
+                break;
+            }
             }
 
             if (id == timeTagID)
+            {
+                point.x = time;
                 time = value;
+            }
 
             // Skip verbose values
-            PJ::PlotData* data = plots[id];
+            PlotDataAccessor* data = tag.plot;
             if (data == nullptr)
                 continue;
 
 #if REDUCE_PLOT
-            double lastVal = lastValue[id];
-            double lastT = lastTime[id];
+            double lastVal = tag.lastValue;
+            double lastT = tag.lastTime;
 
             bool valueChanged = std::abs(lastVal - value) >= 0.00001;
             bool timeChanged = std::abs(time - lastT) >= 0.1;
 
-            if (valueChanged || timeChanged || isXY[id]) {
+            if (valueChanged || timeChanged || tag.isXY) {
 #if ADD_EDGES_TO_PLOT
                 // Add point just before last value to ensure edges are in plot
                 if (lastT >= 0 && valueChanged && timeChanged) {
                     PlotData::Point point(time - 0.001, lastVal);
-                    plots[id]->pushBack(point);
+                    tag.plot->pushBack(point);
                 }
 #endif
 
-                PlotData::Point point(time, value);
-                plots[id]->pushBack(point);
+                point.y = value;
+                data->directAccessPoints().push_back(point);
 
-                lastTime[id] = time;
-                lastValue[id] = value;
+                tag.lastTime = time;
+                tag.lastValue = value;
             }
 #else
-            PlotData::Point point(time, value);
-            data->pushBack(point);
+            point.y = value;
+            tag.plotData->push_back(point);
 #endif
         }
     }
 
+    auto reading_end = std::chrono::high_resolution_clock::now();
+    reading_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(reading_end - reading_start).count();
 
-    // Add for all tags last value at the current time
-    for (size_t i = 0; i < tagIndices.size(); i++) {
-        uint16_t tagIndex = tagIndices[i];
-        if (plots[tagIndex] != nullptr && lastValue[tagIndex] != DBL_MAX) {
-            PlotData::Point point(time, lastValue[tagIndex]);
-            plots[tagIndex]->pushBack(point);
+    // Add for all tags last value at the current time (also trigger range update)
+    for (size_t i = 0; i < maxTagID; i++) {
+		const auto& tag = tagData[i];
+        if (tag.plot != nullptr && tag.lastValue != DBL_MAX) {
+            PlotData::Point point(time, tag.lastValue);
+            tag.plot->pushBack(point);
         }
     }
 
@@ -364,11 +400,15 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo *info, PlotDataMapRef &plot_
         plot_data.addNumeric("VERBOSE_DATA_NOT_LOADED")->second.pushBack(verbosePoint);
         PlotData::Point verboseCountPoint(0, verboseSignalsIgnoredCount);
         plot_data.addNumeric("verbose_signal_count")->second.pushBack(verboseCountPoint);
-
-        
     }
 
-    // QMessageBox::information(nullptr, "File successfully read",  QString("Found %1 signals").arg(maxTagID));
+    if (isGZip) {
+        PlotData::Point decompressPoint(0, decompress_duration_ms);
+        plot_data.addNumeric("dartlog_decompression_time_ms")->second.pushBack(decompressPoint);
+    }
+
+    PlotData::Point readingPoint(0, reading_duration_ms);
+    plot_data.addNumeric("dartlog_reading_time_ms")->second.pushBack(readingPoint);
 
     close();
     progress_dialog.close();
@@ -388,26 +428,25 @@ qint64 DataLoadDARTLog::getPos() {
 
 qint64 DataLoadDARTLog::getSize() {
     if (inputFile != nullptr)
-        return inputFile->size();
+        return inputFileSize;
     return inputData.size();
 }
 
 bool DataLoadDARTLog::atEnd() {
-    if (inputFile != nullptr)
-        return inputFile->atEnd();
-    return pos >= inputData.size();
+    return atEnd(0);
 }
 
-qint64 DataLoadDARTLog::read(char* data, qint64 maxLen) {
-    if (inputFile != nullptr)
-        return inputFile->read(data, maxLen);
+bool DataLoadDARTLog::atEnd(size_t len) {
+    return getPos() + len >= getSize();
+}
 
-    for (size_t i = 0; i < maxLen; i++) {
-        if (atEnd())
-            break;
-        data[i] = inputData.at(pos++);
+void DataLoadDARTLog::read(char* data, qint64 maxLen) {
+    if (inputFile != nullptr)
+        inputFile->read(data, maxLen);
+    else {
+        memcpy(data, inputData.data() + pos, maxLen);
+        pos += maxLen;
     }
-    return maxLen;
 }
 
 void DataLoadDARTLog::skip(qint64 bytes) {
@@ -425,7 +464,7 @@ uint8_t DataLoadDARTLog::readUint8() {
 
 uint16_t DataLoadDARTLog::readUint16() {
     uint8_t b[2];
-    read((char *) b, sizeof(b));
+    read((char*)b, sizeof(b));
 
     return b[0] + b[1] * 256;
 }
