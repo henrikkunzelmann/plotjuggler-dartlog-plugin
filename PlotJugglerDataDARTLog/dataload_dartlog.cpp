@@ -1,18 +1,19 @@
 #include "dataload_dartlog.h"
+
 #include <QFile>
 #include <QMessageBox>
 #include <QDateTime>
 #include <QInputDialog>
-#include <qprogressdialog.h>
-#include <vector>
+#include <QProgressDialog>
 #include <QFileInfo>
 
-#include "qcompressor.h"
+#include <vector>
 #include <chrono>
+#include <zlib.h>
+#include <algorithm>
 
-#define DISABLE_PREFIX_QUESTION 1
 #define REDUCE_PLOT 0
-#define ADD_EDGES_TO_PLOT 
+#define ADD_EDGES_TO_PLOT 0
 
 class PlotDataAccessor : public PlotData {
 public:
@@ -65,34 +66,29 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 
     QApplication::processEvents();
 
-    double decompress_duration_ms = 0;
-    double reading_duration_ms = 0;
+    reading_duration_ms = 0;
+    io_duration_ms = 0;
+    decompress_duration_ms = 0;
 
-    bool isGZip = info->filename.endsWith(".gz", Qt::CaseInsensitive);
+    isGZip = info->filename.endsWith(".gz", Qt::CaseInsensitive);
+    filePtr = &file;
+    inputFileSize = file.size();
+    pos = 0;
+    finished = false;
+    bufferSize = 0;
+    bufferOffset = 0;
+    posBuffer = 0;
+
     if (isGZip) {
-        // Do not directly read file
-        inputFile = nullptr;
-        pos = 0;
-
-        progress_dialog.setLabelText("Decompression... please wait");
-        QByteArray data = file.readAll();
-        if (data.size() == 0) {
-            QMessageBox::warning(nullptr, "Error reading file", "Could not read file");
+        strm.zalloc = Z_NULL;
+        strm.zfree = Z_NULL;
+        strm.opaque = Z_NULL;
+        strm.avail_in = 0;
+        strm.next_in = Z_NULL;
+        if (inflateInit2(&strm, 16 + MAX_WBITS) != Z_OK) {
+            QMessageBox::warning(nullptr, "Error", "Failed to initialize gzip decompressor");
             return false;
         }
-        file.close();
-
-        auto decompress_start = std::chrono::high_resolution_clock::now();
-        if (!QCompressor::gzipDecompress(data, inputData, &progress_dialog)) {
-            QMessageBox::warning(nullptr, "Warning reading file", "Could not fully decompress file: data may be incomplete or fully missing");
-        }
-        auto decompress_end = std::chrono::high_resolution_clock::now();
-        decompress_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(decompress_end - decompress_start).count();
-    }
-    else {
-        // Directly read file
-        inputFile = &file;
-		inputFileSize = file.size();
     }
 
     progress_dialog.setLabelText("Loading data... please wait");
@@ -105,6 +101,12 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
     uint16_t maxTagID = 0;
     uint16_t timeTagID = 0;
     float time = 0;
+
+    // Check if file is empty
+    if (atEnd(64)) {
+        QMessageBox::warning(nullptr, "Error reading file", "File is empty");
+        return false;
+	}
 
     // Read header
     std::string header = readString();
@@ -119,11 +121,6 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 
     bool isAtLeastDARTLOG2 = dartLogVersion.y >= 2;
 
-#if DISABLE_PREFIX_QUESTION
-    bool usePrefix = false;
-#else
-    bool usePrefix = QMessageBox::question(nullptr, "Load with prefix?", "Do you want to load the data with a prefix? If yes, you can load multiple data sets in the same PlotJuggler instance.", QMessageBox::Yes | QMessageBox::No) == QMessageBox::StandardButton::Yes;
-#endif
     bool loadVerboseData = false;
     uint64_t counter = 0;
     uint16_t lastID = 0;
@@ -135,7 +132,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
     while (true) {
         // Update file progress dialog
         if ((counter & (progressDialogTickMask - 1)) == 0) {
-            progress_dialog.setValue((int)std::round((double)getPos() / inputFileSize * 100));
+            progress_dialog.setValue((int)std::round((double)filePtr->pos() / inputFileSize * 100));
             if (progress_dialog.wasCanceled())
                 break;
 
@@ -144,7 +141,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
         counter++;
 
         // Check if at end
-		if (atEnd(64)) // some margin
+		if (atEnd(256)) // some margin
             break;
 
         // Read next tag
@@ -224,9 +221,6 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 
             if (name == "time")
                 timeTagID = tagIndex;
-
-            if (usePrefix)
-                name = fileInfo.baseName().toStdString() + "/" + name;
 
             // Check if the name is the start of a different value
             for (size_t i = 0; i < maxTagID; i++) {
@@ -376,7 +370,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
     }
 
     auto reading_end = std::chrono::high_resolution_clock::now();
-    reading_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(reading_end - reading_start).count();
+	reading_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(reading_end - reading_start).count() / 1000.0;
 
     // Add for all tags last value at the current time (also trigger range update)
     for (size_t i = 0; i < maxTagID; i++) {
@@ -388,7 +382,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
     }
 
     // Add logger informations
-    PlotData::Point version(0, 12);
+    PlotData::Point version(0, 17);
     plot_data.addNumeric("dartlog_version_data")->second.pushBack(dartLogVersion);
     plot_data.addNumeric("dartlog_version_plugin")->second.pushBack(version);
 
@@ -402,10 +396,11 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
         plot_data.addNumeric("verbose_signal_count")->second.pushBack(verboseCountPoint);
     }
 
-    if (isGZip) {
-        PlotData::Point decompressPoint(0, decompress_duration_ms);
-        plot_data.addNumeric("dartlog_decompression_time_ms")->second.pushBack(decompressPoint);
-    }
+    PlotData::Point decompressPoint(0, decompress_duration_ms);
+    plot_data.addNumeric("dartlog_decompression_time_ms")->second.pushBack(decompressPoint);
+
+    PlotData::Point ioPoint(0, io_duration_ms);
+    plot_data.addNumeric("dartlog_io_time_ms")->second.pushBack(ioPoint);
 
     PlotData::Point readingPoint(0, reading_duration_ms);
     plot_data.addNumeric("dartlog_reading_time_ms")->second.pushBack(readingPoint);
@@ -416,44 +411,43 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 }
 
 void DataLoadDARTLog::close() {
-    if (inputFile != nullptr)
-        inputFile->close();
+    if (isGZip && !finished)
+        inflateEnd(&strm);
+    if (filePtr) 
+        filePtr->close();
 }
 
 qint64 DataLoadDARTLog::getPos() {
-    if (inputFile != nullptr)
-        return inputFile->pos();
     return pos;
 }
 
 qint64 DataLoadDARTLog::getSize() {
-    if (inputFile != nullptr)
-        return inputFileSize;
-    return inputData.size();
+    return inputFileSize;
 }
 
 bool DataLoadDARTLog::atEnd() {
     return atEnd(0);
 }
 
-bool DataLoadDARTLog::atEnd(size_t len) {
-    return getPos() + len >= getSize();
+bool DataLoadDARTLog::atEnd(qint64 len) {
+    if (finished)
+        return true;
+
+    if (posBuffer + len > bufferSize)
+        loadMoreData();
+
+    return finished;
 }
 
 void DataLoadDARTLog::read(char* data, qint64 maxLen) {
-    if (inputFile != nullptr)
-        inputFile->read(data, maxLen);
-    else {
-        memcpy(data, inputData.data() + pos, maxLen);
-        pos += maxLen;
-    }
+    memcpy(data, buffer + posBuffer, maxLen);
+    posBuffer += maxLen;
+    pos += maxLen;
 }
 
 void DataLoadDARTLog::skip(qint64 bytes) {
-    if (inputFile != nullptr)
-        inputFile->skip(bytes);
-    else
-        pos += bytes;
+    pos += bytes;
+	posBuffer += bytes;
 }
 
 uint8_t DataLoadDARTLog::readUint8() {
@@ -479,4 +473,80 @@ std::string DataLoadDARTLog::readString() {
         str += c;
     }
     return str;
+}
+
+bool DataLoadDARTLog::loadMoreData() {
+    if (finished)
+        return false;
+
+    // Move remaining data to front
+    qint64 remaining = bufferSize - posBuffer;
+    if (remaining > 0)
+        memmove(buffer, buffer + posBuffer, remaining);
+    posBuffer = 0;
+
+    // Load new chunk into buffer + remaining
+    qint64 loaded = loadNewChunk(buffer + remaining, CHUNK_SIZE);
+    if (loaded == 0) {
+        finished = true;
+        bufferSize = remaining;
+        return remaining > 0;
+    }
+    bufferSize = remaining + loaded;
+    return true;
+}
+
+qint64 DataLoadDARTLog::loadNewChunk(char* chunkBuffer, qint64 maxSize) {
+    if (isGZip) {
+        strm.next_out = (Bytef*)chunkBuffer;
+        strm.avail_out = maxSize;
+
+        while (strm.avail_out > 0 && !finished) {
+            if (strm.avail_in == 0) {
+                auto io_start = std::chrono::high_resolution_clock::now();
+                qint64 readSize = filePtr->read(compressedBuffer, CHUNK_SIZE);
+                auto io_end = std::chrono::high_resolution_clock::now();
+				io_duration_ms += std::chrono::duration_cast<std::chrono::microseconds>(io_end - io_start).count() / 1000.0;
+
+                if (readSize == 0) {
+                    // finish
+                    int ret = inflate(&strm, Z_FINISH);
+                    if (ret == Z_STREAM_END) {
+                        finished = true;
+                    } else {
+                        finished = true;
+                    }
+                    break;
+                }
+                strm.next_in = (Bytef*)compressedBuffer;
+                strm.avail_in = readSize;
+            }
+			auto decompress_start = std::chrono::high_resolution_clock::now();
+            int ret = inflate(&strm, Z_NO_FLUSH);
+            if (ret == Z_STREAM_END) {
+                inflateEnd(&strm);
+                finished = true;
+                break;
+            } else if (ret != Z_OK) {
+                inflateEnd(&strm);
+                finished = true;
+                break;
+            }
+			auto decompress_end = std::chrono::high_resolution_clock::now();
+			decompress_duration_ms += std::chrono::duration_cast<std::chrono::microseconds>(decompress_end - decompress_start).count() / 1000.0;
+        }
+        size_t have = maxSize - strm.avail_out;
+        return have;
+    } 
+    else {
+        // Load directly from file
+        auto io_start = std::chrono::high_resolution_clock::now();
+        qint64 readSize = filePtr->read(chunkBuffer, maxSize);
+        if (readSize == 0) {
+            finished = true;
+        }
+        auto io_end = std::chrono::high_resolution_clock::now();
+        io_duration_ms += std::chrono::duration_cast<std::chrono::milliseconds>(io_end - io_start).count();
+        return readSize;
+    }
 }
