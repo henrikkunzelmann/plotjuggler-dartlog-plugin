@@ -14,6 +14,7 @@
 
 #define REDUCE_PLOT 0
 #define ADD_EDGES_TO_PLOT 0
+#define DOWNSAMPLE_HZ 100
 
 class PlotDataAccessor : public PlotData {
 public:
@@ -32,6 +33,7 @@ struct TagData {
     bool isXY;
     bool isVerbose;
     std::string tagName;
+    double lastAddedTime;
 };
 
 DataLoadDARTLog::DataLoadDARTLog() {
@@ -79,6 +81,14 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
     bufferOffset = 0;
     posBuffer = 0;
 
+    bool downsample = false;
+    if (inputFileSize > 150LL * 1024 * 1024) {
+        double sizeMB = inputFileSize / (1024.0 * 1024.0);
+        QMessageBox::StandardButton reply = QMessageBox::question(nullptr, "Large File", QString("File size is %1 MB. Downsample to 100 Hz?").arg(std::round(sizeMB), 0, 'f', 0), QMessageBox::Yes | QMessageBox::No);
+        if (reply == QMessageBox::Yes) 
+            downsample = true;
+    }
+
     if (isGZip) {
         strm.zalloc = Z_NULL;
         strm.zfree = Z_NULL;
@@ -100,7 +110,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 
     uint16_t maxTagID = 0;
     uint16_t timeTagID = 0;
-    float time = 0;
+    double time = 0;
 
     // Check if file is empty
     if (atEnd(64)) {
@@ -249,6 +259,9 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
             }
 
             tagData[tagIndex].isVerbose = verbose;
+            tagData[tagIndex].lastTime = -1;
+            tagData[tagIndex].lastValue = DBL_MAX;
+            tagData[tagIndex].lastAddedTime = -1;
         }
         else {
             if (id > maxTagID) {
@@ -256,7 +269,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
                 break;
             }
 
-			const auto& tag = tagData[id];
+			auto& tag = tagData[id];
             if (tag.type == 0) {
                 QMessageBox::warning(nullptr, "Error reading file", "Invalid ID read: unknown tag id");
                 break;
@@ -267,66 +280,66 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 
             double value = 0;
             switch (type) {
-            case 1: {
-                uint8_t v;
-                read((char*)&v, sizeof(v));
-                value = (double)v;
-                break;
-            }
-            case 2: {
-                uint16_t v;
-                read((char*)&v, sizeof(v));
-                value = (double)v;
-                break;
-            }
-            case 3: {
-                uint32_t v;
-                read((char*)&v, sizeof(v));
-                value = (double)v;
-                break;
-            }
-            case 4: {
-                int8_t v;
-                read((char*)&v, sizeof(v));
-                value = (double)v;
-                break;
-            }
-            case 5: {
-                int16_t v;
-                read((char*)&v, sizeof(v));
-                value = (double)v;
-                break;
-            }
-            case 6: {
-                int32_t v;
-                read((char*)&v, sizeof(v));
-                value = (double)v;
-                break;
-            }
-            case 7: {
-                float v;
-                read((char*)&v, sizeof(v));
-                value = (double)v;
-                break;
-            }
-            case 8: {
-                double v;
-                read((char*)&v, sizeof(v));
-                value = (double)v;
-                break;
-            }
-            case 9: {
-                uint64_t v;
-                read((char*)&v, sizeof(v));
-                value = (double)v;
-                break;
-            }
-            case 10: {
-                int64_t v;
-                read((char*)&v, sizeof(v));
-                value = (double)v;
-                break;
-            }
+                case 1: {
+                    uint8_t v;
+                    read((char*)&v, sizeof(v));
+                    value = (double)v;
+                    break;
+                }
+                case 2: {
+                    uint16_t v;
+                    read((char*)&v, sizeof(v));
+                    value = (double)v;
+                    break;
+                }
+                case 3: {
+                    uint32_t v;
+                    read((char*)&v, sizeof(v));
+                    value = (double)v;
+                    break;
+                }
+                case 4: {
+                    int8_t v;
+                    read((char*)&v, sizeof(v));
+                    value = (double)v;
+                    break;
+                }
+                case 5: {
+                    int16_t v;
+                    read((char*)&v, sizeof(v));
+                    value = (double)v;
+                    break;
+                }
+                case 6: {
+                    int32_t v;
+                    read((char*)&v, sizeof(v));
+                    value = (double)v;
+                    break;
+                }
+                case 7: {
+                    float v;
+                    read((char*)&v, sizeof(v));
+                    value = (double)v;
+                    break;
+                }
+                case 8: {
+                    double v;
+                    read((char*)&v, sizeof(v));
+                    value = (double)v;
+                    break;
+                }
+                case 9: {
+                    uint64_t v;
+                    read((char*)&v, sizeof(v));
+                    value = (double)v;
+                    break;
+                }
+                case 10: {
+                    int64_t v;
+                    read((char*)&v, sizeof(v));
+                    value = (double)v;
+                    break;
+                }
             }
 
             if (id == timeTagID)
@@ -364,7 +377,15 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
             }
 #else
             point.y = value;
-            tag.plotData->push_back(point);
+
+            if (downsample) {
+                if (tag.lastAddedTime < 0 || std::abs(time - tag.lastAddedTime) >= 1.0 / DOWNSAMPLE_HZ) {
+                    tag.plotData->push_back(point);
+                    tag.lastAddedTime = time;
+                }
+            } 
+            else 
+                tag.plotData->push_back(point);
 #endif
         }
     }
@@ -404,6 +425,9 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 
     PlotData::Point readingPoint(0, reading_duration_ms);
     plot_data.addNumeric("dartlog_reading_time_ms")->second.pushBack(readingPoint);
+
+    PlotData::Point downsamplePoint(0, downsample ? DOWNSAMPLE_HZ : 0.0);
+    plot_data.addNumeric("dartlog_downsampled")->second.pushBack(downsamplePoint);
 
     close();
     progress_dialog.close();

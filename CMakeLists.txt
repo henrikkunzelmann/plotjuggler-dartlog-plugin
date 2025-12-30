@@ -92,9 +92,7 @@ endif()
 
 add_library(PlotJugglerDataDARTLog SHARED
    PlotJugglerDataDARTLog/dataload_dartlog.h
-   PlotJugglerDataDARTLog/dataload_dartlog.cpp
-   PlotJugglerDataDARTLog/qcompressor.h
-   PlotJugglerDataDARTLog/qcompressor.cpp   )
+   PlotJugglerDataDARTLog/dataload_dartlog.cpp)
 
 target_link_libraries(PlotJugglerDataDARTLog ${PJ_LIBRARIES} ${PlotJuggler_LIBRARY} "${CMAKE_CURRENT_SOURCE_DIR}/zlib/lib/zlibwapi.lib")
 # target_link_libraries(PlotJugglerDataDARTLog ${PJ_LIBRARIES})
