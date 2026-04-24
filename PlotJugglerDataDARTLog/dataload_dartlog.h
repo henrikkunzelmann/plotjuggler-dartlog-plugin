@@ -56,6 +56,8 @@ protected:
     void skip(qint64 bytes);
     uint8_t readUint8();
     uint16_t readUint16();
+    uint32_t readUint32();
+    uint64_t readUint64();
 
     std::string readString();
 

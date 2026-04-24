@@ -11,6 +11,13 @@
 #include <chrono>
 #include <zlib.h>
 #include <algorithm>
+#include <cfloat>
+#include <cstdint>
+#include <deque>
+#include <limits>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #define REDUCE_PLOT 0
 #define ADD_EDGES_TO_PLOT 0
@@ -23,18 +30,119 @@ public:
     }
 };
 
-// Struct to hold all tag-related data
-struct TagData {
-    uint16_t type;
-    PlotDataAccessor* plot;
-    std::deque<PlotData::Point>* plotData;
-    double lastTime;
-    double lastValue;
-    bool isXY;
-    bool isVerbose;
-    std::string tagName;
-    double lastAddedTime;
+namespace {
+
+enum SignalDataType : uint8_t {
+    TYPE_UINT8 = 1,
+    TYPE_UINT16 = 2,
+    TYPE_UINT32 = 3,
+    TYPE_INT8 = 4,
+    TYPE_INT16 = 5,
+    TYPE_INT32 = 6,
+    TYPE_FLOAT = 7,
+    TYPE_DOUBLE = 8,
+    TYPE_UINT64 = 9,
+    TYPE_INT64 = 10,
+    TYPE_STRING = 11,
+    TYPE_ENUM = 12,
+    TYPE_BYTE_ARRAY_32BIT = 13,
+    TYPE_BYTE_ARRAY_64BIT = 14,
+    TYPE_FLOAT_ARRAY = 15,
+    TYPE_DOUBLE_ARRAY = 16
 };
+
+struct NumericSeriesState {
+    PlotDataAccessor* plot = nullptr;
+    std::deque<PlotData::Point>* plotData = nullptr;
+    double lastValue = DBL_MAX;
+    double lastAddedTime = -1;
+};
+
+struct StringSeriesState {
+    StringSeries* plot = nullptr;
+    std::string lastValue;
+    bool hasLastValue = false;
+    double lastAddedTime = -1;
+};
+
+struct EnumValueState {
+    double value = 0;
+    std::string label;
+    NumericSeriesState series;
+};
+
+struct ArrayElementSeriesState {
+    NumericSeriesState series;
+};
+
+struct TagData {
+    uint8_t type = 0;
+    uint8_t enumValueType = 0;
+    bool isVerbose = false;
+    bool isIgnored = false;
+    std::string tagName;
+    NumericSeriesState numericSeries;
+    StringSeriesState stringSeries;
+    std::vector<EnumValueState> enumValues;
+    std::vector<ArrayElementSeriesState> arraySeries;
+};
+
+double fast_abs(double x) {
+    if (x < 0)
+		return -x;
+	return x;
+}
+
+bool isNumericType(uint8_t type) {
+    return type >= TYPE_UINT8 && type <= TYPE_INT64;
+}
+
+bool isSupportedType(uint8_t type, bool isAtLeastDARTLOG3) {
+    if (isNumericType(type)) {
+        return true;
+    }
+
+    if (!isAtLeastDARTLOG3) {
+        return false;
+    }
+
+    return type == TYPE_STRING || type == TYPE_ENUM ||
+            type == TYPE_BYTE_ARRAY_32BIT || type == TYPE_BYTE_ARRAY_64BIT ||
+            type == TYPE_FLOAT_ARRAY || type == TYPE_DOUBLE_ARRAY;
+}
+
+bool startsWith(const std::string& value, const std::string& prefix) {
+    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::string normalizeTagName(std::string name) {
+    std::replace(name.begin(), name.end(), '_', '/');
+    return name;
+}
+
+std::string buildEnumSeriesName(const std::string& signalName,
+                                const std::string& enumLabel,
+                                std::unordered_set<std::string>& usedNames) {
+    std::string suffix = enumLabel.empty() ? "value" : enumLabel;
+    std::string seriesName = signalName + "/" + suffix;
+
+    if (usedNames.insert(seriesName).second) {
+        return seriesName;
+    }
+
+    for (size_t duplicateIndex = 1;; ++duplicateIndex) {
+        std::string candidate = seriesName + "/" + std::to_string(duplicateIndex);
+        if (usedNames.insert(candidate).second) {
+            return candidate;
+        }
+    }
+}
+
+std::string buildArraySeriesName(const std::string& signalName, size_t index) {
+    return signalName + "/" + std::to_string(index);
+}
+
+}  // namespace
 
 DataLoadDARTLog::DataLoadDARTLog() {
     _extensions.push_back("dat");
@@ -44,8 +152,6 @@ DataLoadDARTLog::DataLoadDARTLog() {
 const std::vector<const char*>& DataLoadDARTLog::compatibleFileExtensions() const {
     return _extensions;
 }
-
-TagData tagData[UINT16_MAX];
 
 
 bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_data) {
@@ -108,8 +214,10 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 
     auto reading_start = std::chrono::high_resolution_clock::now();
 
-    uint16_t maxTagID = 0;
-    uint16_t timeTagID = 0;
+    std::unordered_map<uint32_t, TagData> tagData;
+
+    uint32_t timeTagID = 0;
+    bool hasTimeTag = false;
     double time = 0;
 
     // Check if file is empty
@@ -120,7 +228,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 
     // Read header
     std::string header = readString();
-    if (header != "DARTLOG" && header != "DARTLOG2") {
+    if (header != "DARTLOG" && header != "DARTLOG2" && header != "DARTLOG3") {
         QMessageBox::warning(nullptr, "Error reading file", "Not a DARTLOG file: header missing.");
         return false;
     }
@@ -128,21 +236,161 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
     PlotData::Point dartLogVersion(0, 1);
     if (header == "DARTLOG2")
         dartLogVersion = PlotData::Point(0, 2);
+    else if (header == "DARTLOG3")
+        dartLogVersion = PlotData::Point(0, 3);
 
     bool isAtLeastDARTLOG2 = dartLogVersion.y >= 2;
+    bool isAtLeastDARTLOG3 = dartLogVersion.y >= 3;
 
     bool loadVerboseData = false;
     uint64_t counter = 0;
-    uint16_t lastID = 0;
+    uint32_t lastID = 0;
     const uint64_t progressDialogTickMask = (1024 * 1024);
 
     uint32_t verboseSignalsIgnoredCount = 0;
+    uint32_t byteArraySignalsIgnoredCount = 0;
+    const double downsampleInterval = 1.0 / DOWNSAMPLE_HZ;
+
+    auto initNumericSeries = [&](NumericSeriesState& state, const std::string& name) {
+        auto it = plot_data.addNumeric(name);
+        auto plot = reinterpret_cast<PlotDataAccessor*>(&it->second);
+
+        state.plot = plot;
+        state.plotData = plot->directAccessPoints();
+        state.lastValue = DBL_MAX;
+        state.lastAddedTime = -1;
+    };
+
+    auto initStringSeries = [&](StringSeriesState& state, const std::string& name) {
+        auto it = plot_data.addStringSeries(name);
+
+        state.plot = &it->second;
+        state.lastValue.clear();
+        state.hasLastValue = false;
+        state.lastAddedTime = -1;
+    };
+
+    auto pushNumericPoint = [&](NumericSeriesState& state, double timestamp, double value) {
+        if (state.plotData == nullptr) {
+            return;
+        }
+
+        PlotData::Point localPoint(timestamp, value);
+        if (downsample) {
+            if (state.lastAddedTime < 0 || fast_abs(timestamp - state.lastAddedTime) >= downsampleInterval) {
+                state.plotData->push_back(localPoint);
+                state.lastAddedTime = timestamp;
+            }
+        }
+        else {
+            state.plotData->push_back(localPoint);
+        }
+
+        state.lastValue = value;
+    };
+
+    auto pushStringPoint = [&](StringSeriesState& state, double timestamp, const std::string& value) {
+        if (state.plot == nullptr) {
+            return;
+        }
+
+        if (downsample && state.lastAddedTime >= 0 && fast_abs(timestamp - state.lastAddedTime) < downsampleInterval) {
+            state.lastValue = value;
+            state.hasLastValue = true;
+            return;
+        }
+
+        state.plot->pushBack({ timestamp, StringRef(value) });
+        state.lastAddedTime = timestamp;
+        state.lastValue = value;
+        state.hasLastValue = true;
+    };
+
+    auto finalizeNumericSeries = [&](const NumericSeriesState& state) {
+        if (state.plot != nullptr && state.lastValue != DBL_MAX) {
+            state.plot->pushBack(PlotData::Point(time, state.lastValue));
+        }
+    };
+
+    auto finalizeStringSeries = [&](const StringSeriesState& state) {
+        if (state.plot != nullptr && state.hasLastValue) {
+            state.plot->pushBack({ time, StringRef(state.lastValue) });
+        }
+    };
+
+    auto ensureArraySeries = [&](TagData& tag, size_t elementCount) {
+        while (tag.arraySeries.size() < elementCount) {
+            ArrayElementSeriesState elementState;
+            initNumericSeries(elementState.series,
+                              buildArraySeriesName(tag.tagName, tag.arraySeries.size()));
+            tag.arraySeries.push_back(std::move(elementState));
+        }
+    };
+
+    auto readNumericValue = [&](uint8_t type, double& value) {
+        switch (type) {
+            case TYPE_UINT8: {
+                value = static_cast<double>(readUint8());
+                return true;
+            }
+            case TYPE_UINT16: {
+                value = static_cast<double>(readUint16());
+                return true;
+            }
+            case TYPE_UINT32: {
+                value = static_cast<double>(readUint32());
+                return true;
+            }
+            case TYPE_INT8: {
+                int8_t v;
+                read(reinterpret_cast<char*>(&v), sizeof(v));
+                value = static_cast<double>(v);
+                return true;
+            }
+            case TYPE_INT16: {
+                int16_t v;
+                read(reinterpret_cast<char*>(&v), sizeof(v));
+                value = static_cast<double>(v);
+                return true;
+            }
+            case TYPE_INT32: {
+                int32_t v;
+                read(reinterpret_cast<char*>(&v), sizeof(v));
+                value = static_cast<double>(v);
+                return true;
+            }
+            case TYPE_FLOAT: {
+                float v;
+                read(reinterpret_cast<char*>(&v), sizeof(v));
+                value = static_cast<double>(v);
+                return true;
+            }
+            case TYPE_DOUBLE: {
+                double v;
+                read(reinterpret_cast<char*>(&v), sizeof(v));
+                value = v;
+                return true;
+            }
+            case TYPE_UINT64: {
+                value = static_cast<double>(readUint64());
+                return true;
+            }
+            case TYPE_INT64: {
+                int64_t v;
+                read(reinterpret_cast<char*>(&v), sizeof(v));
+                value = static_cast<double>(v);
+                return true;
+            }
+            default:
+                return false;
+        }
+    };
 
     PlotData::Point point(0, 0);
     while (true) {
         // Update file progress dialog
         if ((counter & (progressDialogTickMask - 1)) == 0) {
-            progress_dialog.setValue((int)std::round((double)filePtr->pos() / inputFileSize * 100));
+            progress_dialog.setValue((int)std::round((double)pos / inputFileSize * 100));
             if (progress_dialog.wasCanceled())
                 break;
 
@@ -155,11 +403,16 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
             break;
 
         // Read next tag
-        uint16_t id;
+        uint32_t id;
         if (isAtLeastDARTLOG2) {
             uint8_t idPart = readUint8();
-            if (idPart == 255)
-                id = readUint16();
+            if (idPart == 255) {
+                uint32_t extendedID = readUint16();
+                if (isAtLeastDARTLOG3 && extendedID == std::numeric_limits<uint16_t>::max()) {
+                    extendedID = readUint32();
+                }
+                id = extendedID;
+            }
             else if (idPart == 254)
                 id = lastID + 1;
             else
@@ -171,26 +424,59 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
         lastID = id;
 
         if (id == 0) {
-            uint16_t tagIndex = readUint16();
+            uint32_t tagIndex = readUint16();
+            if (isAtLeastDARTLOG3 && tagIndex == std::numeric_limits<uint16_t>::max()) {
+                tagIndex = readUint32();
+            }
 
-            uint8_t tagType;
-            read((char*)&tagType, sizeof(tagType));
+            uint8_t tagType = readUint8();
 
-            if (tagType < 1 || tagType > 10) {
+            if (!isSupportedType(tagType, isAtLeastDARTLOG3)) {
                 QMessageBox::warning(nullptr, "Error reading file", "Wrong tag type read");
                 break;
             }
 
-            tagData[tagIndex].type = tagType;
-
-            if (tagIndex > maxTagID)
-                maxTagID = tagIndex;
+            TagData newTag;
+            newTag.type = tagType;
 
             std::string name = readString();
 
             if (name.length() == 0) {
                 QMessageBox::warning(nullptr, "Error reading file", "Empty tag name read");
                 break;
+            }
+
+            if (tagType == TYPE_ENUM) {
+                newTag.enumValueType = readUint8();
+                if (!isNumericType(newTag.enumValueType)) {
+                    QMessageBox::warning(nullptr, "Error reading file", "Wrong enum value type read");
+                    break;
+                }
+
+                uint32_t enumValueCount = readUint16();
+                if (enumValueCount == std::numeric_limits<uint16_t>::max()) {
+                    enumValueCount = readUint32();
+                }
+
+                newTag.enumValues.reserve(enumValueCount);
+                bool enumDefinitionValid = true;
+                for (uint32_t valueIndex = 0; valueIndex < enumValueCount; ++valueIndex) {
+                    double enumValue = 0;
+                    if (!readNumericValue(newTag.enumValueType, enumValue)) {
+                        QMessageBox::warning(nullptr, "Error reading file", "Unsupported enum value type read");
+                        enumDefinitionValid = false;
+                        break;
+                    }
+
+                    EnumValueState enumState;
+                    enumState.value = enumValue;
+                    enumState.label = readString();
+                    newTag.enumValues.push_back(std::move(enumState));
+                }
+
+                if (!enumDefinitionValid) {
+                    break;
+                }
             }
 
             std::string unit = "";
@@ -200,13 +486,13 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
                 while (true)
                 {
                     uint8_t attributeType;
-                    read((char*)&attributeType, sizeof(attributeType));
+                    read(reinterpret_cast<char*>(&attributeType), sizeof(attributeType));
 
                     if (attributeType == 0)
                         break;
 
                     uint8_t attributeLength;
-                    read((char*)&attributeLength, sizeof(attributeLength));
+                    read(reinterpret_cast<char*>(&attributeLength), sizeof(attributeLength));
 
                     switch (attributeType)
                     {
@@ -227,14 +513,16 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
                 }
             }
 
-            std::replace(name.begin(), name.end(), '_', '/');
+            name = normalizeTagName(name);
 
-            if (name == "time")
+            if (name == "time") {
                 timeTagID = tagIndex;
+                hasTimeTag = true;
+            }
 
             // Check if the name is the start of a different value
-            for (size_t i = 0; i < maxTagID; i++) {
-                if (!tagData[i].tagName.empty() && tagData[i].tagName._Starts_with(name)) {
+            for (const auto& tagEntry : tagData) {
+                if (!tagEntry.second.tagName.empty() && startsWith(tagEntry.second.tagName, name)) {
                     name += "/Value";
                     break;
                 }
@@ -244,148 +532,156 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
             if (unit.length() > 0)
                 name += "_" + unit;
 
-            tagData[tagIndex].tagName = name;
+            newTag.tagName = name;
+            newTag.isVerbose = verbose;
 
-            if (verbose && !loadVerboseData) {
-                tagData[tagIndex].plot = nullptr;
+            if (tagType == TYPE_BYTE_ARRAY_32BIT || tagType == TYPE_BYTE_ARRAY_64BIT) {
+                newTag.isIgnored = true;
+                byteArraySignalsIgnoredCount++;
+            }
+            else if (verbose && !loadVerboseData) {
+                newTag.isIgnored = true;
                 verboseSignalsIgnoredCount++;
             }
-            else {
-                auto it = plot_data.addNumeric(name);
-                auto plot = (PlotDataAccessor*)&it->second;
+            else if (tagType == TYPE_STRING) {
+                initStringSeries(newTag.stringSeries, name);
+            }
+            else if (tagType == TYPE_ENUM) {
+                std::unordered_set<std::string> usedEnumSeriesNames;
 
-                tagData[tagIndex].plot = plot;
-				tagData[tagIndex].plotData = plot->directAccessPoints();
+                initStringSeries(newTag.stringSeries, name);
+                initNumericSeries(newTag.numericSeries, name + "_raw");
+
+                for (auto& enumState : newTag.enumValues) {
+                    initNumericSeries(enumState.series,
+                                      buildEnumSeriesName(name, enumState.label, usedEnumSeriesNames));
+                }
+            }
+            else {
+                initNumericSeries(newTag.numericSeries, name);
             }
 
-            tagData[tagIndex].isVerbose = verbose;
-            tagData[tagIndex].lastTime = -1;
-            tagData[tagIndex].lastValue = DBL_MAX;
-            tagData[tagIndex].lastAddedTime = -1;
+            tagData[tagIndex] = std::move(newTag);
         }
         else {
-            if (id > maxTagID) {
-                QMessageBox::warning(nullptr, "Error reading file", "Invalid ID read: over max tag id");
-                break;
-            }
-
-			auto& tag = tagData[id];
-            if (tag.type == 0) {
+            auto tagIt = tagData.find(id);
+            if (tagIt == tagData.end() || tagIt->second.type == 0) {
                 QMessageBox::warning(nullptr, "Error reading file", "Invalid ID read: unknown tag id");
                 break;
             }
 
-            // Read value
-            uint8_t type = tag.type;
+			auto& tag = tagIt->second;
 
-            double value = 0;
-            switch (type) {
-                case 1: {
-                    uint8_t v;
-                    read((char*)&v, sizeof(v));
-                    value = (double)v;
-                    break;
-                }
-                case 2: {
-                    uint16_t v;
-                    read((char*)&v, sizeof(v));
-                    value = (double)v;
-                    break;
-                }
-                case 3: {
-                    uint32_t v;
-                    read((char*)&v, sizeof(v));
-                    value = (double)v;
-                    break;
-                }
-                case 4: {
-                    int8_t v;
-                    read((char*)&v, sizeof(v));
-                    value = (double)v;
-                    break;
-                }
-                case 5: {
-                    int16_t v;
-                    read((char*)&v, sizeof(v));
-                    value = (double)v;
-                    break;
-                }
-                case 6: {
-                    int32_t v;
-                    read((char*)&v, sizeof(v));
-                    value = (double)v;
-                    break;
-                }
-                case 7: {
-                    float v;
-                    read((char*)&v, sizeof(v));
-                    value = (double)v;
-                    break;
-                }
-                case 8: {
-                    double v;
-                    read((char*)&v, sizeof(v));
-                    value = (double)v;
-                    break;
-                }
-                case 9: {
-                    uint64_t v;
-                    read((char*)&v, sizeof(v));
-                    value = (double)v;
-                    break;
-                }
-                case 10: {
-                    int64_t v;
-                    read((char*)&v, sizeof(v));
-                    value = (double)v;
-                    break;
-                }
+            if (tag.type == TYPE_BYTE_ARRAY_32BIT) {
+                skip(readUint32());
+                continue;
             }
 
-            if (id == timeTagID)
+            if (tag.type == TYPE_BYTE_ARRAY_64BIT) {
+                uint64_t length = readUint64();
+                if (length > static_cast<uint64_t>(std::numeric_limits<qint64>::max())) {
+                    QMessageBox::warning(nullptr, "Error reading file", "BYTE_ARRAY_64BIT entry too large");
+                    break;
+                }
+
+                skip(static_cast<qint64>(length));
+                continue;
+            }
+
+            if (tag.type == TYPE_STRING) {
+                std::string value = readString();
+
+                if (tag.isIgnored) {
+                    continue;
+                }
+
+                pushStringPoint(tag.stringSeries, time, value);
+                continue;
+            }
+
+            if (tag.type == TYPE_FLOAT_ARRAY || tag.type == TYPE_DOUBLE_ARRAY) {
+                uint32_t elementCount = readUint32();
+                ensureArraySeries(tag, elementCount);
+
+                for (uint32_t elementIndex = 0; elementIndex < elementCount; ++elementIndex) {
+                    double elementValue = 0;
+                    if (tag.type == TYPE_FLOAT_ARRAY) {
+                        float v;
+                        read(reinterpret_cast<char*>(&v), sizeof(v));
+                        elementValue = static_cast<double>(v);
+                    }
+                    else {
+                        double v;
+                        read(reinterpret_cast<char*>(&v), sizeof(v));
+                        elementValue = v;
+                    }
+
+                    if (!tag.isIgnored) {
+                        pushNumericPoint(tag.arraySeries[elementIndex].series, time, elementValue);
+                    }
+                }
+                continue;
+            }
+
+            // Read value
+            uint8_t type = (tag.type == TYPE_ENUM) ? tag.enumValueType : tag.type;
+
+            double value = 0;
+            if (!readNumericValue(type, value)) {
+                QMessageBox::warning(nullptr, "Error reading file", "Unsupported signal value type");
+                break;
+            }
+
+            if (hasTimeTag && id == timeTagID)
             {
-                point.x = time;
                 time = value;
+                point.x = time;
             }
 
             // Skip verbose values
-            PlotDataAccessor* data = tag.plot;
-            if (data == nullptr)
+            if (tag.isIgnored)
                 continue;
 
+            if (tag.type == TYPE_ENUM) {
+                std::string enumLabel = std::to_string(value);
+
+                pushNumericPoint(tag.numericSeries, time, value);
+                for (auto& enumState : tag.enumValues) {
+                    bool isActive = (enumState.value == value);
+                    pushNumericPoint(enumState.series, time, isActive ? 1.0 : 0.0);
+                    if (isActive) {
+                        enumLabel = enumState.label;
+                    }
+                }
+
+                pushStringPoint(tag.stringSeries, time, enumLabel);
+                continue;
+            }
+
 #if REDUCE_PLOT
-            double lastVal = tag.lastValue;
-            double lastT = tag.lastTime;
+            double lastVal = tag.numericSeries.lastValue;
+            double lastT = tag.numericSeries.lastAddedTime;
 
-            bool valueChanged = std::abs(lastVal - value) >= 0.00001;
-            bool timeChanged = std::abs(time - lastT) >= 0.1;
+            bool valueChanged = fast_abs(lastVal - value) >= 0.00001;
+            bool timeChanged = fast_abs(time - lastT) >= 0.1;
 
-            if (valueChanged || timeChanged || tag.isXY) {
+            if (valueChanged || timeChanged) {
 #if ADD_EDGES_TO_PLOT
                 // Add point just before last value to ensure edges are in plot
                 if (lastT >= 0 && valueChanged && timeChanged) {
                     PlotData::Point point(time - 0.001, lastVal);
-                    tag.plot->pushBack(point);
+                    tag.numericSeries.plot->pushBack(point);
                 }
 #endif
 
                 point.y = value;
-                data->directAccessPoints().push_back(point);
+                tag.numericSeries.plotData->push_back(point);
 
-                tag.lastTime = time;
-                tag.lastValue = value;
+                tag.numericSeries.lastAddedTime = time;
+                tag.numericSeries.lastValue = value;
             }
 #else
-            point.y = value;
-
-            if (downsample) {
-                if (tag.lastAddedTime < 0 || std::abs(time - tag.lastAddedTime) >= 1.0 / DOWNSAMPLE_HZ) {
-                    tag.plotData->push_back(point);
-                    tag.lastAddedTime = time;
-                }
-            } 
-            else 
-                tag.plotData->push_back(point);
+            pushNumericPoint(tag.numericSeries, time, value);
 #endif
         }
     }
@@ -394,16 +690,20 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 	reading_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(reading_end - reading_start).count() / 1000.0;
 
     // Add for all tags last value at the current time (also trigger range update)
-    for (size_t i = 0; i < maxTagID; i++) {
-		const auto& tag = tagData[i];
-        if (tag.plot != nullptr && tag.lastValue != DBL_MAX) {
-            PlotData::Point point(time, tag.lastValue);
-            tag.plot->pushBack(point);
+    for (const auto& tagEntry : tagData) {
+		const auto& tag = tagEntry.second;
+        finalizeNumericSeries(tag.numericSeries);
+        finalizeStringSeries(tag.stringSeries);
+        for (const auto& enumState : tag.enumValues) {
+            finalizeNumericSeries(enumState.series);
+        }
+        for (const auto& arrayState : tag.arraySeries) {
+            finalizeNumericSeries(arrayState.series);
         }
     }
 
     // Add logger informations
-    PlotData::Point version(0, 17);
+    PlotData::Point version(0, 19);
     plot_data.addNumeric("dartlog_version_data")->second.pushBack(dartLogVersion);
     plot_data.addNumeric("dartlog_version_plugin")->second.pushBack(version);
 
@@ -415,6 +715,14 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
         plot_data.addNumeric("VERBOSE_DATA_NOT_LOADED")->second.pushBack(verbosePoint);
         PlotData::Point verboseCountPoint(0, verboseSignalsIgnoredCount);
         plot_data.addNumeric("verbose_signal_count")->second.pushBack(verboseCountPoint);
+    }
+
+    if (byteArraySignalsIgnoredCount > 0) {
+        PlotData::Point ignoredByteArrayPoint(0, byteArraySignalsIgnoredCount);
+        plot_data.addNumeric("BYTE_ARRAY_DATA_NOT_LOADED")->second.pushBack(ignoredByteArrayPoint);
+
+        PlotData::Point ignoredByteArrayCountPoint(0, byteArraySignalsIgnoredCount);
+        plot_data.addNumeric("byte_array_signal_count")->second.pushBack(ignoredByteArrayCountPoint);
     }
 
     PlotData::Point decompressPoint(0, decompress_duration_ms);
@@ -464,14 +772,42 @@ bool DataLoadDARTLog::atEnd(qint64 len) {
 }
 
 void DataLoadDARTLog::read(char* data, qint64 maxLen) {
-    memcpy(data, buffer + posBuffer, maxLen);
-    posBuffer += maxLen;
-    pos += maxLen;
+    qint64 copied = 0;
+    while (copied < maxLen) {
+        if (posBuffer >= bufferSize && !loadMoreData()) {
+            break;
+        }
+
+        qint64 available = bufferSize - posBuffer;
+        if (available <= 0) {
+            break;
+        }
+
+        qint64 chunk = std::min(maxLen - copied, available);
+        memcpy(data + copied, buffer + posBuffer, chunk);
+        posBuffer += chunk;
+        pos += chunk;
+        copied += chunk;
+    }
 }
 
 void DataLoadDARTLog::skip(qint64 bytes) {
-    pos += bytes;
-	posBuffer += bytes;
+    qint64 skipped = 0;
+    while (skipped < bytes) {
+        if (posBuffer >= bufferSize && !loadMoreData()) {
+            break;
+        }
+
+        qint64 available = bufferSize - posBuffer;
+        if (available <= 0) {
+            break;
+        }
+
+        qint64 chunk = std::min(bytes - skipped, available);
+        posBuffer += chunk;
+        pos += chunk;
+        skipped += chunk;
+    }
 }
 
 uint8_t DataLoadDARTLog::readUint8() {
@@ -487,8 +823,33 @@ uint16_t DataLoadDARTLog::readUint16() {
     return b[0] + b[1] * 256;
 }
 
+uint32_t DataLoadDARTLog::readUint32() {
+    uint8_t b[4];
+    read((char*)b, sizeof(b));
+
+    return static_cast<uint32_t>(b[0]) |
+           (static_cast<uint32_t>(b[1]) << 8) |
+           (static_cast<uint32_t>(b[2]) << 16) |
+           (static_cast<uint32_t>(b[3]) << 24);
+}
+
+uint64_t DataLoadDARTLog::readUint64() {
+    uint8_t b[8];
+    read((char*)b, sizeof(b));
+
+    return static_cast<uint64_t>(b[0]) |
+           (static_cast<uint64_t>(b[1]) << 8) |
+           (static_cast<uint64_t>(b[2]) << 16) |
+           (static_cast<uint64_t>(b[3]) << 24) |
+           (static_cast<uint64_t>(b[4]) << 32) |
+           (static_cast<uint64_t>(b[5]) << 40) |
+           (static_cast<uint64_t>(b[6]) << 48) |
+           (static_cast<uint64_t>(b[7]) << 56);
+}
+
 std::string DataLoadDARTLog::readString() {
     std::string str = "";
+    str.reserve(64);
     while (!atEnd()) {
         char c;
         read(&c, sizeof(c));
@@ -570,7 +931,7 @@ qint64 DataLoadDARTLog::loadNewChunk(char* chunkBuffer, qint64 maxSize) {
             finished = true;
         }
         auto io_end = std::chrono::high_resolution_clock::now();
-        io_duration_ms += std::chrono::duration_cast<std::chrono::milliseconds>(io_end - io_start).count();
+        io_duration_ms += std::chrono::duration_cast<std::chrono::microseconds>(io_end - io_start).count() / 1000.0;
         return readSize;
     }
 }
