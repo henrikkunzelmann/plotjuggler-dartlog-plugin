@@ -16,8 +16,8 @@
 #include <deque>
 #include <limits>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #define REDUCE_PLOT 0
 #define ADD_EDGES_TO_PLOT 0
@@ -51,6 +51,20 @@ enum SignalDataType : uint8_t {
     TYPE_DOUBLE_ARRAY = 16
 };
 
+enum TagAttributeType : uint8_t {
+    ATTR_UNIT = 1,
+    ATTR_VERBOSE_SIGNAL = 2,
+    ATTR_GENERATE_CONVERSION_SIGNAL = 3,
+    ATTR_GENERATE_NEGATE_SIGNAL = 4,
+    ATTR_GENERATE_ABS_SIGNAL = 5
+};
+
+enum class GeneratedSignalOperation : uint8_t {
+    Conversion,
+    Negate,
+    Abs
+};
+
 struct NumericSeriesState {
     PlotDataAccessor* plot = nullptr;
     std::deque<PlotData::Point>* plotData = nullptr;
@@ -75,16 +89,27 @@ struct ArrayElementSeriesState {
     NumericSeriesState series;
 };
 
+struct GeneratedSignalSeriesState {
+    GeneratedSignalOperation operation = GeneratedSignalOperation::Conversion;
+    std::string unit;
+    double scale = 1.0;
+    double offset = 0.0;
+    NumericSeriesState series;
+};
+
 struct TagData {
     uint8_t type = 0;
     uint8_t enumValueType = 0;
     bool isVerbose = false;
     bool isIgnored = false;
+    std::string baseName;
+    std::string unit;
     std::string tagName;
     NumericSeriesState numericSeries;
     StringSeriesState stringSeries;
     std::vector<EnumValueState> enumValues;
     std::vector<ArrayElementSeriesState> arraySeries;
+    std::vector<GeneratedSignalSeriesState> generatedSignals;
 };
 
 double fast_abs(double x) {
@@ -118,6 +143,37 @@ bool startsWith(const std::string& value, const std::string& prefix) {
 std::string normalizeTagName(std::string name) {
     std::replace(name.begin(), name.end(), '_', '/');
     return name;
+}
+
+std::string normalizeUnitName(std::string unit) {
+    std::replace(unit.begin(), unit.end(), '/', '_');
+    return unit;
+}
+
+std::string appendUnitToTagName(const std::string& signalName, const std::string& unit) {
+    if (unit.empty()) {
+        return signalName;
+    }
+    return signalName + "_" + unit;
+}
+
+std::string buildGeneratedSeriesName(const TagData& tag,
+                                     const GeneratedSignalSeriesState& generatedSignal) {
+    switch (generatedSignal.operation) {
+        case GeneratedSignalOperation::Conversion: {
+            std::string convertedName = appendUnitToTagName(tag.baseName, generatedSignal.unit);
+            if (convertedName == tag.tagName) {
+                convertedName += "_Converted";
+            }
+            return convertedName;
+        }
+        case GeneratedSignalOperation::Negate:
+            return tag.tagName + "_Negated";
+        case GeneratedSignalOperation::Abs:
+            return tag.tagName + "_Abs";
+    }
+
+    return tag.tagName + "_Generated";
 }
 
 std::string buildEnumSeriesName(const std::string& signalName,
@@ -214,7 +270,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 
     auto reading_start = std::chrono::high_resolution_clock::now();
 
-    std::unordered_map<uint32_t, TagData> tagData;
+    std::vector<TagData> tagData;
 
     uint32_t timeTagID = 0;
     bool hasTimeTag = false;
@@ -315,6 +371,25 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
     auto finalizeStringSeries = [&](const StringSeriesState& state) {
         if (state.plot != nullptr && state.hasLastValue) {
             state.plot->pushBack({ time, StringRef(state.lastValue) });
+        }
+    };
+
+    auto pushGeneratedSignalPoints = [&](TagData& tag, double timestamp, double sourceValue) {
+        for (auto& generatedSignal : tag.generatedSignals) {
+            double generatedValue = sourceValue;
+            switch (generatedSignal.operation) {
+                case GeneratedSignalOperation::Conversion:
+                    generatedValue = sourceValue * generatedSignal.scale + generatedSignal.offset;
+                    break;
+                case GeneratedSignalOperation::Negate:
+                    generatedValue = -sourceValue;
+                    break;
+                case GeneratedSignalOperation::Abs:
+                    generatedValue = fast_abs(sourceValue);
+                    break;
+            }
+
+            pushNumericPoint(generatedSignal.series, timestamp, generatedValue);
         }
     };
 
@@ -485,29 +560,68 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
             {
                 while (true)
                 {
-                    uint8_t attributeType;
-                    read(reinterpret_cast<char*>(&attributeType), sizeof(attributeType));
+                    uint8_t attributeType = readUint8();
 
                     if (attributeType == 0)
                         break;
 
-                    uint8_t attributeLength;
-                    read(reinterpret_cast<char*>(&attributeLength), sizeof(attributeLength));
+                    uint32_t attributeLength = isAtLeastDARTLOG3 ? readUint16() : readUint8();
+                    std::vector<char> attributeData(attributeLength);
+                    if (attributeLength > 0) {
+                        read(attributeData.data(), attributeLength);
+                    }
+
+                    auto attributeString = [&attributeData]() {
+                        auto stringEnd = std::find(attributeData.begin(), attributeData.end(), '\0');
+                        return std::string(attributeData.begin(), stringEnd);
+                    };
 
                     switch (attributeType)
                     {
-                    case 1: {   // unit
-                        unit = readString();
-                        std::replace(unit.begin(), unit.end(), '/', '_');
+                    case ATTR_UNIT: {
+                        unit = normalizeUnitName(attributeString());
                         break;
                     }
-                    case 2: { // verbose signal
-                        verbose = readUint8() > 0;
+                    case ATTR_VERBOSE_SIGNAL: {
+                        verbose = !attributeData.empty() && static_cast<uint8_t>(attributeData[0]) > 0;
+                        break;
+                    }
+                    case ATTR_GENERATE_CONVERSION_SIGNAL: {
+                        auto nullIt = std::find(attributeData.begin(), attributeData.end(), '\0');
+                        size_t unitLength = static_cast<size_t>(std::distance(attributeData.begin(), nullIt));
+                        size_t numericOffset = unitLength + 1;
+
+                        if (numericOffset + sizeof(float) + sizeof(float) <= attributeData.size()) {
+                            float scale = 1.0f;
+                            float offset = 0.0f;
+                            memcpy(&scale, attributeData.data() + numericOffset, sizeof(float));
+                            memcpy(&offset, attributeData.data() + numericOffset + sizeof(float), sizeof(float));
+
+                            GeneratedSignalSeriesState generatedSignal;
+                            generatedSignal.operation = GeneratedSignalOperation::Conversion;
+                            generatedSignal.unit = normalizeUnitName(std::string(attributeData.data(), unitLength));
+                            generatedSignal.scale = static_cast<double>(scale);
+                            generatedSignal.offset = static_cast<double>(offset);
+                            newTag.generatedSignals.push_back(std::move(generatedSignal));
+                        }
+                        break;
+                    }
+                    case ATTR_GENERATE_NEGATE_SIGNAL: {
+                        GeneratedSignalSeriesState generatedSignal;
+                        generatedSignal.operation = GeneratedSignalOperation::Negate;
+                        generatedSignal.unit = unit;
+                        newTag.generatedSignals.push_back(std::move(generatedSignal));
+                        break;
+                    }
+                    case ATTR_GENERATE_ABS_SIGNAL: {
+                        GeneratedSignalSeriesState generatedSignal;
+                        generatedSignal.operation = GeneratedSignalOperation::Abs;
+                        generatedSignal.unit = unit;
+                        newTag.generatedSignals.push_back(std::move(generatedSignal));
                         break;
                     }
 
                     default:
-                        skip(attributeLength);
                         break;
                     }
                 }
@@ -521,16 +635,16 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
             }
 
             // Check if the name is the start of a different value
-            for (const auto& tagEntry : tagData) {
-                if (!tagEntry.second.tagName.empty() && startsWith(tagEntry.second.tagName, name)) {
+            for (const auto& existingTag : tagData) {
+                if (!existingTag.tagName.empty() && startsWith(existingTag.tagName, name)) {
                     name += "/Value";
                     break;
                 }
             }
 
-            // Add unit
-            if (unit.length() > 0)
-                name += "_" + unit;
+            newTag.baseName = name;
+            newTag.unit = unit;
+            name = appendUnitToTagName(name, unit);
 
             newTag.tagName = name;
             newTag.isVerbose = verbose;
@@ -561,16 +675,25 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
                 initNumericSeries(newTag.numericSeries, name);
             }
 
+            if (!newTag.isIgnored && (isNumericType(tagType) || tagType == TYPE_ENUM)) {
+                for (auto& generatedSignal : newTag.generatedSignals) {
+                    initNumericSeries(generatedSignal.series,
+                                      buildGeneratedSeriesName(newTag, generatedSignal));
+                }
+            }
+
+            if (tagData.size() <= tagIndex) {
+                tagData.resize(static_cast<size_t>(tagIndex) + 4096);
+            }
             tagData[tagIndex] = std::move(newTag);
         }
         else {
-            auto tagIt = tagData.find(id);
-            if (tagIt == tagData.end() || tagIt->second.type == 0) {
+            if (tagData.size() <= id || tagData[id].type == 0) {
                 QMessageBox::warning(nullptr, "Error reading file", "Invalid ID read: unknown tag id");
                 break;
             }
 
-			auto& tag = tagIt->second;
+			auto& tag = tagData[id];
 
             if (tag.type == TYPE_BYTE_ARRAY_32BIT) {
                 skip(readUint32());
@@ -646,6 +769,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
                 std::string enumLabel = std::to_string(value);
 
                 pushNumericPoint(tag.numericSeries, time, value);
+                pushGeneratedSignalPoints(tag, time, value);
                 for (auto& enumState : tag.enumValues) {
                     bool isActive = (enumState.value == value);
                     pushNumericPoint(enumState.series, time, isActive ? 1.0 : 0.0);
@@ -682,6 +806,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
             }
 #else
             pushNumericPoint(tag.numericSeries, time, value);
+            pushGeneratedSignalPoints(tag, time, value);
 #endif
         }
     }
@@ -690,8 +815,7 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
 	reading_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(reading_end - reading_start).count() / 1000.0;
 
     // Add for all tags last value at the current time (also trigger range update)
-    for (const auto& tagEntry : tagData) {
-		const auto& tag = tagEntry.second;
+        for (const auto& tag : tagData) {
         finalizeNumericSeries(tag.numericSeries);
         finalizeStringSeries(tag.stringSeries);
         for (const auto& enumState : tag.enumValues) {
@@ -700,10 +824,13 @@ bool DataLoadDARTLog::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_
         for (const auto& arrayState : tag.arraySeries) {
             finalizeNumericSeries(arrayState.series);
         }
+        for (const auto& generatedSignal : tag.generatedSignals) {
+            finalizeNumericSeries(generatedSignal.series);
+        }
     }
 
     // Add logger informations
-    PlotData::Point version(0, 19);
+    PlotData::Point version(0, 20);
     plot_data.addNumeric("dartlog_version_data")->second.pushBack(dartLogVersion);
     plot_data.addNumeric("dartlog_version_plugin")->second.pushBack(version);
 
@@ -762,13 +889,13 @@ bool DataLoadDARTLog::atEnd() {
 }
 
 bool DataLoadDARTLog::atEnd(qint64 len) {
-    if (finished)
-        return true;
+    while (posBuffer + len > bufferSize && !finished) {
+        if (!loadMoreData()) {
+            break;
+        }
+    }
 
-    if (posBuffer + len > bufferSize)
-        loadMoreData();
-
-    return finished;
+    return posBuffer + len > bufferSize;
 }
 
 void DataLoadDARTLog::read(char* data, qint64 maxLen) {

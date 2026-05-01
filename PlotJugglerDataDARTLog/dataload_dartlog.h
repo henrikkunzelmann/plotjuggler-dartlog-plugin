@@ -28,7 +28,7 @@ public:
 
 
 protected:
-    static const qint64 CHUNK_SIZE = 1024 * 1024;
+    static const qint64 CHUNK_SIZE = 1024 * 1024 * 4;
 
     QFile* filePtr;
     qint64 inputFileSize;
